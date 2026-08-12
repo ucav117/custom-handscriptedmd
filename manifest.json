@@ -1,0 +1,10 @@
+{
+	"id": "handwriting-to-markdown",
+	"name": "HandTranscriptMd",
+	"version": "1.0.4",
+	"minAppVersion": "1.7.2",
+	"description": "Inline handwriting canvas with OCR conversion through a self-hosted Turnstone server.",
+	"author": "GabrieleC",
+	"authorUrl": "https://github.com/gabriele-cusato",
+	"isDesktopOnly": false
+}

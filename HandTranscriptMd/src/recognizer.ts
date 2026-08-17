@@ -6,7 +6,7 @@
    model alias the user configured on their server.
    ============================================= */
 
-import { requestUrl } from 'obsidian';
+import { requestUrl, RequestUrlResponse } from 'obsidian';
 
 interface TurnstoneCreateResponse {
 	ws_id?: string;
@@ -67,6 +67,22 @@ function multipartBody(meta: Record<string, unknown>, image: Uint8Array, boundar
 	return joinBytes([encoder.encode(start), image, encoder.encode(`\r\n--${boundary}--\r\n`)]);
 }
 
+// requestUrl's `.json` getter lazily runs JSON.parse and throws a raw, unhelpful
+// error ("Unexpected end of JSON input") when the body is empty or not JSON —
+// e.g. wrong baseUrl, a proxy/error page in front of Turnstone, or a 204/empty
+// response. Surface the HTTP status and a snippet of the actual body instead.
+function safeJson(response: RequestUrlResponse): unknown {
+	try {
+		return response.json;
+	} catch {
+		const snippet = response.text.trim().slice(0, 200);
+		throw new Error(
+			`Turnstone returned an invalid response (HTTP ${response.status}, ${snippet ? `body: ${snippet}` : 'empty body'}). ` +
+			`Check that the Turnstone server URL is correct and the server is running.`
+		);
+	}
+}
+
 function errorMessage(status: number, json: unknown): string {
 	const body = json as TurnstoneErrorResponse | undefined;
 	return body?.error ?? body?.detail ?? `HTTP ${status}`;
@@ -106,9 +122,9 @@ class TurnstoneRecognizer implements IRecognizer {
 			throw: false,
 		});
 		if (create.status < 200 || create.status >= 300) {
-			throw new Error(`Turnstone ${errorMessage(create.status, create.json)}`);
+			throw new Error(`Turnstone ${errorMessage(create.status, safeJson(create))}`);
 		}
-		const wsId = (create.json as TurnstoneCreateResponse)?.ws_id;
+		const wsId = (safeJson(create) as TurnstoneCreateResponse)?.ws_id;
 		if (!wsId) throw new Error('Turnstone returned no workstream ID');
 
 		const deadline = Date.now() + this.options.timeoutSeconds * 1000;
@@ -121,9 +137,9 @@ class TurnstoneRecognizer implements IRecognizer {
 					throw: false,
 				});
 				if (history.status < 200 || history.status >= 300) {
-					throw new Error(`Turnstone ${errorMessage(history.status, history.json)}`);
+					throw new Error(`Turnstone ${errorMessage(history.status, safeJson(history))}`);
 				}
-				const messages = (history.json as TurnstoneHistoryResponse)?.messages ?? [];
+				const messages = (safeJson(history) as TurnstoneHistoryResponse)?.messages ?? [];
 				const answer = [...messages].reverse().find(message => message.role === 'assistant');
 				if (answer?.content?.trim()) return answer.content.trim();
 				await new Promise(resolve => window.setTimeout(resolve, 750));

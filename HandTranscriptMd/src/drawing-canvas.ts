@@ -127,6 +127,9 @@ export class DrawingCanvas {
 		this.canvas.addEventListener('pointermove', this.boundMove);
 		this.canvas.addEventListener('pointerup', this.boundUp);
 		this.canvas.addEventListener('pointerleave', this.boundUp);
+		// pointercancel (gesture di sistema che interrompe il touch/pen, tipico su Android):
+		// senza questo listener isDrawing/currentStroke restano bloccati perché pointerup non arriva mai.
+		this.canvas.addEventListener('pointercancel', this.boundUp);
 	}
 
 	/* --- API pubblica --- */
@@ -186,6 +189,7 @@ export class DrawingCanvas {
 		this.canvas.addEventListener('pointermove', onMove);
 		this.canvas.addEventListener('pointerup', onStop);
 		this.canvas.addEventListener('pointerleave', onStop);
+		this.canvas.addEventListener('pointercancel', onStop);
 
 		// Registra la funzione di cleanup per destroy()
 		this.fingerScrollCleanup = () => {
@@ -193,6 +197,7 @@ export class DrawingCanvas {
 			this.canvas.removeEventListener('pointermove', onMove);
 			this.canvas.removeEventListener('pointerup', onStop);
 			this.canvas.removeEventListener('pointerleave', onStop);
+			this.canvas.removeEventListener('pointercancel', onStop);
 		};
 	}
 
@@ -287,6 +292,7 @@ export class DrawingCanvas {
 		this.canvas.removeEventListener('pointermove', this.boundMove);
 		this.canvas.removeEventListener('pointerup', this.boundUp);
 		this.canvas.removeEventListener('pointerleave', this.boundUp);
+		this.canvas.removeEventListener('pointercancel', this.boundUp);
 		// Rimuove i listener aggiuntivi per lo scroll con il dito (se impostati)
 		this.fingerScrollCleanup?.();
 	}

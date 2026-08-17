@@ -398,9 +398,29 @@ export function expandKeywords(text: string, fnStart = 1): string {
 /**
  * Pipeline completa: normalizzazione simboli → espansione keyword.
  * Questa è la funzione principale da usare per l'output OCR grezzo.
+ *
+ * @param fnStart - numero di partenza per le footnote //FN (default 1).
+ *   Passare nextFootnoteNumber() sul contenuto esistente della nota evita
+ *   collisioni quando la nota contiene già footnote da blocchi convertiti prima.
  */
-export function parseHandwritingToMarkdown(rawOcrText: string): string {
-	return expandKeywords(normalizeMarkdownSymbols(rawOcrText));
+export function parseHandwritingToMarkdown(rawOcrText: string, fnStart = 1): string {
+	return expandKeywords(normalizeMarkdownSymbols(rawOcrText), fnStart);
+}
+
+/**
+ * Analizza il markdown già presente nella nota e restituisce il primo numero
+ * di footnote libero, così una nuova conversione non sovrascrive/collide con
+ * footnote [^N]: già presenti (es. da un blocco handwriting convertito in precedenza).
+ */
+export function nextFootnoteNumber(existingContent: string): number {
+	let max = 0;
+	const re = /\[\^(\d+)\]:/g;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(existingContent)) !== null) {
+		const n = parseInt(m[1], 10);
+		if (n > max) max = n;
+	}
+	return max + 1;
 }
 
 

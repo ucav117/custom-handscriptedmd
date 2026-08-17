@@ -11,7 +11,7 @@ import { DrawingCanvas, Stroke } from './drawing-canvas';
 import { strokesToSvg, parseSvgStrokes, svgToBase64Png, archiveSvgFile } from './svg-utils';
 import { getEffectiveBgColor, getEffectiveLineColor, remapStrokeColor, LIGHT_COLORS, DARK_COLORS, resolveIsDark, BgMode } from './settings';
 import { getRecognizer } from './recognizer';
-import { parseHandwritingToMarkdown } from './md-parser';
+import { parseHandwritingToMarkdown, nextFootnoteNumber } from './md-parser';
 import { t, type I18nKey } from './i18n';
 
 export const VIEW_TYPE_HANDWRITING = 'handwriting-editor';
@@ -26,10 +26,15 @@ function wikiEmbedRegex(svgPath: string): RegExp {
 	return new RegExp(`\\n?!\\[\\[${esc}\\]\\]\\n?`);
 }
 
-// Regex per trovare il code block legacy con l'id specifico
+// Regex per trovare il code block legacy con l'id specifico.
+// Vedi il commento gemello in embed.ts: i lookahead negativi (?!```) impediscono
+// al match lazy di scavalcare la chiusura di un blocco precedente.
 function codeBlockRegex(embedId: string): RegExp {
 	const esc = embedId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	return new RegExp('\\n?```handwriting\\n.*?"id"\\s*:\\s*"' + esc + '".*?\\n```\\n?', 's');
+	return new RegExp(
+		'\\n?```handwriting\\n(?:(?!```)[\\s\\S])*?"id"\\s*:\\s*"' + esc +
+		'"(?:(?!```)[\\s\\S])*?\\n```\\n?'
+	);
 }
 
 // Applica una sostituzione sul file .md.
@@ -214,8 +219,11 @@ async function buildEditorUI(opts: {
 		canvas.loadStrokes(remapped);
 	}
 
-	// Setup specifico della classe chiamante (ResizeObserver su Android, rAF su Desktop)
-	opts.afterCanvas(canvas, scrollWrap, canvasWidth);
+	// Setup specifico della classe chiamante (ResizeObserver su Android, rAF su Desktop).
+	// Passa `w` (larghezza reale del canvas, da viewBox salvato o default) e non il
+	// default grezzo `canvasWidth`: DrawingModal confronta questo valore con la larghezza
+	// del modal per decidere se comprimere un disegno auto-espanso oltre il default corrente.
+	opts.afterCanvas(canvas, scrollWrap, w);
 
 	// Resize handle (visibile ma non interattivo)
 	const handle = scrollWrap.createDiv({ cls: 'hwm_resize-handle hwm_resize-handle--disabled' });
@@ -414,7 +422,9 @@ export class DrawingEditorView extends ItemView {
 			});
 			const rawText = await recognizer.recognize(base64);
 			if (!rawText.trim()) throw new Error(t('error_no_text'));
-			const markdown = parseHandwritingToMarkdown(rawText);
+			const mdFile = this.plugin.app.vault.getAbstractFileByPath(this.sourcePath);
+			const existingContent = mdFile instanceof TFile ? await this.plugin.app.vault.read(mdFile) : '';
+			const markdown = parseHandwritingToMarkdown(rawText, nextFootnoteNumber(existingContent));
 			await archiveSvgFile(this.svgPath, this.plugin);
 			await replaceInMdFile(this.sourcePath, this.svgPath, this.embedId, '\n' + markdown + '\n', this.plugin);
 			overlay.remove();
@@ -577,7 +587,9 @@ export class DrawingModal extends Modal {
 			});
 			const rawText = await recognizer.recognize(base64);
 			if (!rawText.trim()) throw new Error(t('error_no_text'));
-			const markdown = parseHandwritingToMarkdown(rawText);
+			const mdFile = this.plugin.app.vault.getAbstractFileByPath(this.sourcePath);
+			const existingContent = mdFile instanceof TFile ? await this.plugin.app.vault.read(mdFile) : '';
+			const markdown = parseHandwritingToMarkdown(rawText, nextFootnoteNumber(existingContent));
 			await archiveSvgFile(this.svgPath, this.plugin);
 			await replaceInMdFile(this.sourcePath, this.svgPath, this.embedId, '\n' + markdown + '\n', this.plugin);
 			overlay.remove();

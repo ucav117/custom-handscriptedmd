@@ -24,7 +24,7 @@ import { Stroke } from './drawing-canvas';
 import { strokesToSvg, parseSvgStrokes, generateId, svgToBase64Png, archiveSvgFile } from './svg-utils';
 import { getEffectiveBgColor, getEffectiveLineColor, remapStrokeColor, BgMode, resolveIsDark } from './settings';
 import { getRecognizer } from './recognizer';
-import { parseHandwritingToMarkdown } from './md-parser';
+import { parseHandwritingToMarkdown, nextFootnoteNumber } from './md-parser';
 import { VIEW_TYPE_HANDWRITING, DrawingEditorView, DrawingModal } from './editor-view';
 
 // Dati JSON salvati dentro il code block ```handwriting (formato legacy)
@@ -102,9 +102,16 @@ export function registerEmbed(plugin: HandwritingPlugin) {
 // appaiono nel DOM. Funziona sia in reading view che in live preview
 // (in live preview il post-processor non viene chiamato sui widget CM6).
 function setupMutationObserver(plugin: HandwritingPlugin) {
-	const tryDecorate = (span: HTMLElement) => {
+	// Limite tentativi per il polling sotto: ~15s (100 × 150ms), poi si rinuncia
+	// invece di ritentare all'infinito su un embed che non caricherà mai
+	// (SVG mancante/rotto, o nota chiusa prima del caricamento dell'immagine).
+	const MAX_DECORATE_ATTEMPTS = 100;
+
+	const tryDecorate = (span: HTMLElement, attempt = 0) => {
 		// Salta se già decorato (flag data attribute — più affidabile del parent check)
 		if (span.dataset.hwmDecorated === '1') return;
+		// Il nodo è stato rimosso dal DOM prima che l'immagine finisse di caricare: rinuncia.
+		if (!span.isConnected) return;
 
 		const svgPath = span.getAttribute('src') ?? '';
 		if (!svgPath.includes('_handwriting/') || !svgPath.endsWith('.svg')) return;
@@ -116,7 +123,8 @@ function setupMutationObserver(plugin: HandwritingPlugin) {
 		// Se Obsidian non ha ancora caricato l'immagine (classe image-embed
 		// assente), riprova tra 150 ms — il caricamento è asincrono.
 		if (!span.classList.contains('image-embed')) {
-			window.setTimeout(() => tryDecorate(span), 150);
+			if (attempt >= MAX_DECORATE_ATTEMPTS) return;
+			window.setTimeout(() => tryDecorate(span, attempt + 1), 150);
 			return;
 		}
 
@@ -291,11 +299,15 @@ function showLegacyPreview(
 	// --- Preview SVG via CSS background-image (nessun <img> dentro cm-content) ---
 	const preview = container.createDiv({ cls: 'hwm_inline-preview' });
 	let isExpanded = true;
+	let isConverting = false; // guardia di ri-entranza: evita doppie conversioni concorrenti
 
 	let currentSvgContent = svgContent;
 	let currentStrokes = strokes;
 
 	renderPreviewContent(preview, currentSvgContent);
+
+	// Traccia embedId → svgPath per il remap automatico al cambio bgMode (come il formato wiki)
+	plugin.embedPaths.set(data.id, data.svg);
 
 	// Callback refresh dalla tab editor
 	plugin.previewCallbacks.set(data.id, (newSvgContent) => {
@@ -306,36 +318,50 @@ function showLegacyPreview(
 	});
 
 	// Collapse/Expand: max-height via CSS var --hwm-max-h su .hwm_collapsed
+	const doExpand = () => {
+		isExpanded = true;
+		preview.classList.remove('hwm_collapsed');
+		collapseBtn.classList.remove('hwm_rotated');
+		collapseBtn.title = t('btn_collapse');
+		collapseBtn.setAttribute('data-hwm-key', 'btn_collapse');
+	};
+	const doCollapse = () => {
+		isExpanded = false;
+		preview.setCssProps({ '--hwm-max-h': collapsedHeight + 'px' });
+		preview.classList.add('hwm_collapsed');
+		collapseBtn.classList.add('hwm_rotated');
+		collapseBtn.title = t('btn_expand');
+		collapseBtn.setAttribute('data-hwm-key', 'btn_expand');
+	};
 	collapseBtn.addEventListener('click', (e) => {
 		e.stopPropagation();
-		isExpanded = !isExpanded;
-		if (isExpanded) {
-			preview.classList.remove('hwm_collapsed');
-			collapseBtn.classList.remove('hwm_rotated');
-			collapseBtn.title = t('btn_collapse');
-			collapseBtn.setAttribute('data-hwm-key', 'btn_collapse');
-		} else {
-			preview.setCssProps({ '--hwm-max-h': collapsedHeight + 'px' });
-			preview.classList.add('hwm_collapsed');
-			collapseBtn.classList.add('hwm_rotated');
-			collapseBtn.title = t('btn_expand');
-			collapseBtn.setAttribute('data-hwm-key', 'btn_expand');
-		}
+		if (isExpanded) doCollapse(); else doExpand();
 	});
 
 	// Bottone matita portale (fuori da cm-content)
 	createLegacyPortalButton(container, plugin.app, plugin, data.id, data.svg, ctx.sourcePath);
 
-	// Converti
+	// Converti — guardia isConverting: ignora click ripetuti mentre una conversione è in corso
+	// (senza guardia, un doppio click legge due volte lo stesso file e la seconda scrittura
+	// sovrascrive la prima: "lost update").
+	const doConvertAction = async () => {
+		if (isConverting) return;
+		if (!currentSvgContent || currentStrokes.length === 0) {
+			new Notice(t('error_no_strokes'));
+			return;
+		}
+		isConverting = true;
+		try {
+			await doConvert(currentSvgContent, data, ctx, plugin);
+		} finally {
+			isConverting = false;
+		}
+	};
 	convertBtn.addEventListener('click', (e) => {
 		e.stopPropagation();
-		void (async () => {
-			if (!currentSvgContent || currentStrokes.length === 0) {
-				new Notice(t('error_no_strokes'));
-				return;
-			}
-			await doConvert(currentSvgContent, data, ctx, plugin);
-		})();
+		// doConvert() mostra già l'errore via Notice; qui va solo evitata la unhandled rejection
+		// (doConvert rilancia l'errore per permettere a "converti tutti" di fermarsi al primo fallimento).
+		void doConvertAction().catch(() => { /* già notificato */ });
 	});
 
 	// Elimina
@@ -346,6 +372,29 @@ function showLegacyPreview(
 			await removeLegacyEmbed(ctx, data, plugin);
 		})();
 	});
+
+	// Registra le azioni nel plugin per il menu "⋮ Espandi/Collassa/Converti tutti" (come il formato wiki)
+	plugin.embedActions.set(data.id, {
+		expand: doExpand,
+		collapse: doCollapse,
+		convert: doConvertAction,
+		container,
+		sourcePath: ctx.sourcePath,
+	});
+	plugin.register(() => plugin.embedActions.delete(data.id));
+
+	// Cleanup di embedPaths/previewCallbacks quando il container esce dal DOM
+	// (stesso meccanismo già usato da createPortalPanel per il formato wiki)
+	const onLayoutChange = () => {
+		if (!container.isConnected) {
+			plugin.app.workspace.off('layout-change', onLayoutChange);
+			plugin.embedPaths.delete(data.id);
+			plugin.previewCallbacks.delete(data.id);
+			return;
+		}
+	};
+	plugin.app.workspace.on('layout-change', onLayoutChange);
+	plugin.register(() => plugin.app.workspace.off('layout-change', onLayoutChange));
 }
 
 // Renderizza l'SVG come CSS background-image su un <div> (legacy).
@@ -374,7 +423,9 @@ function renderPreviewContent(preview: HTMLElement, svgContent: string | null) {
 
 // Esegue il riconoscimento OCR su un SVG e restituisce il testo markdown.
 // Lancia eccezione in caso di errore — il chiamante decide se catturarla o propagarla.
-async function runOcrPipeline(svgContent: string, plugin: HandwritingPlugin): Promise<string> {
+// sourcePath: file .md di destinazione, usato per calcolare il numero di footnote
+// di partenza (evita collisioni [^1] con footnote già presenti nella nota).
+async function runOcrPipeline(svgContent: string, plugin: HandwritingPlugin, sourcePath: string): Promise<string> {
 	new Notice(t('notice_recognizing'));
 	const svgEl = new DOMParser()
 		.parseFromString(svgContent, 'image/svg+xml')
@@ -391,7 +442,9 @@ async function runOcrPipeline(svgContent: string, plugin: HandwritingPlugin): Pr
 	if (!rawText.trim()) throw new Error(t('error_no_text'));
 	// In modalità debug mostra il testo grezzo restituito da Turnstone (prima del parsing)
 	if (plugin.settings.debugMode) new Notice(`[DEBUG] Testo grezzo Turnstone:\n${rawText}`, 30000);
-	return parseHandwritingToMarkdown(rawText);
+	const mdFile = plugin.app.vault.getAbstractFileByPath(sourcePath);
+	const existingContent = mdFile instanceof TFile ? await plugin.app.vault.read(mdFile) : '';
+	return parseHandwritingToMarkdown(rawText, nextFootnoteNumber(existingContent));
 }
 
 /* =============================================
@@ -405,7 +458,7 @@ async function doConvertWiki(
 	plugin: HandwritingPlugin
 ) {
 	// Lancia eccezione in caso di errore (il chiamante decide se mostrare Notice o propagare)
-	const markdown = await runOcrPipeline(svgContent, plugin);
+	const markdown = await runOcrPipeline(svgContent, plugin, sourcePath);
 	await archiveSvgFile(svgPath, plugin);
 	await replaceWikiEmbedWithMarkdown(svgPath, markdown, sourcePath, plugin);
 	new Notice(t('notice_converted'));
@@ -422,12 +475,14 @@ async function doConvert(
 	plugin: HandwritingPlugin
 ) {
 	try {
-		const markdown = await runOcrPipeline(svgContent, plugin);
+		const markdown = await runOcrPipeline(svgContent, plugin, ctx.sourcePath);
 		await archiveSvgFile(data.svg, plugin);
 		await replaceEmbedWithMarkdown(ctx, data, markdown, plugin);
 		new Notice(t('notice_converted'));
 	} catch (e: unknown) {
 		new Notice(t('error_ocr') + (e instanceof Error ? e.message : String(e)));
+		// Rilancia: permette al chiamante (es. "converti tutti" in main.ts) di fermarsi al primo errore.
+		throw e;
 	}
 }
 
@@ -459,11 +514,16 @@ function wikiEmbedRegex(svgPath: string): RegExp {
 	return new RegExp(`\\n?!\\[\\[${escaped}\\]\\]\\n?`);
 }
 
-// Regex per trovare il code block legacy con l'id specifico
+// Regex per trovare il code block legacy con l'id specifico.
+// Le porzioni lazy sono ristrette con lookahead negativi che escludono ``` :
+// senza di essi, un match lazy non ancorato può "saltare" oltre la chiusura
+// di un blocco precedente per trovare l'id nel blocco successivo, finendo
+// per inglobare (e cancellare/sovrascrivere) anche il blocco precedente.
 function codeBlockRegex(embedId: string): RegExp {
 	const escaped = escapeRegex(embedId);
 	return new RegExp(
-		'\\n?```handwriting\\n.*?"id"\\s*:\\s*"' + escaped + '".*?\\n```\\n?', 's'
+		'\\n?```handwriting\\n(?:(?!```)[\\s\\S])*?"id"\\s*:\\s*"' + escaped +
+		'"(?:(?!```)[\\s\\S])*?\\n```\\n?'
 	);
 }
 
@@ -790,8 +850,10 @@ function createPortalPanel(
 		isConverting = false;
 	};
 
-	// Avvia la conversione OCR con overlay. Non lancia eccezioni:
-	// gli errori vengono mostrati nell'overlay stesso con pulsante OK.
+	// Avvia la conversione OCR con overlay. L'overlay mostra sempre l'errore con
+	// pulsante OK, ma l'eccezione viene comunque rilanciata dopo averlo costruito:
+	// permette a "converti tutti" (main.ts) di fermarsi realmente al primo errore
+	// invece di continuare in silenzio sugli embed successivi.
 	const doConvertAction = async () => {
 		if (isConverting) return; // skip se gia' in corso (usato anche da 'converti tutti')
 		isConverting = true;
@@ -810,13 +872,16 @@ function createPortalPanel(
 			const okBtn = overlay.createEl('button', { text: 'OK', cls: 'hwm_convert-ok-btn mod-warning' });
 			// L'overlay resta visibile finche' l'utente non clicca OK
 			okBtn.addEventListener('click', () => removeConvertOverlay(overlay), { once: true });
+			throw e;
 		}
 	};
 
 	collapseBtn.addEventListener('click', () => {
 		if (isExpanded) doCollapse(); else doExpand();
 	});
-	convertBtn.addEventListener('click', () => { void doConvertAction(); });
+	// Il click diretto ignora l'eccezione rilanciata (l'errore è già mostrato nell'overlay);
+	// solo "converti tutti" (main.ts) la osserva per fermare il ciclo.
+	convertBtn.addEventListener('click', () => { void doConvertAction().catch(() => { /* già notificato */ }); });
 
 	// Registra le azioni nel plugin per il menu "⋮ Espandi/Collassa/Converti tutti"
 	plugin.embedActions.set(embedId, { expand: doExpand, collapse: doCollapse, convert: doConvertAction, container, sourcePath });
@@ -827,6 +892,7 @@ function createPortalPanel(
 		if (!container.isConnected) {
 			plugin.app.workspace.off('layout-change', onLayoutChange);
 			plugin.embedPaths.delete(embedId);
+			plugin.previewCallbacks.delete(embedId);
 			return;
 		}
 		if (Platform.isMobile) {
@@ -910,8 +976,23 @@ function createLegacyPortalButton(
 		}
 	});
 
-	// Apre la tab editor al click
+	// Apre l'editor al click: Desktop → DrawingModal (overlay fullscreen, come il formato wiki),
+	// Mobile → tab dedicata. Prima di questo fix apriva sempre una tab anche su Desktop,
+	// un'esperienza inconsistente rispetto al bottone matita del formato wiki.
+	let modalOpen = false;
 	btn.addEventListener('click', () => { void (async () => {
+		if (Platform.isDesktop) {
+			if (modalOpen) return;
+			modalOpen = true;
+			btn.classList.add('hwm_hidden');
+			const modal = new DrawingModal(plugin.app, plugin, embedId, svgPath, sourcePath);
+			modal.onClosed = () => {
+				modalOpen = false;
+				if (container.isConnected) btn.classList.remove('hwm_hidden');
+			};
+			modal.open();
+			return;
+		}
 		const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_HANDWRITING);
 		const existing = leaves.find(l => (l.view as DrawingEditorView).getEmbedId() === embedId);
 		if (existing) {
@@ -940,7 +1021,9 @@ function createLegacyPortalButton(
 			'--hwm-top':  `${rect.top + 6}px`,
 			'--hwm-left': `${rect.right - 44}px`,
 		});
-		const editorOpen = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_HANDWRITING)
+		// modalOpen: su Desktop il modal non è una "leaf" tracciabile con getLeavesOfType,
+		// va considerato esplicitamente per non far ricomparire il bottone sopra il modal aperto.
+		const editorOpen = modalOpen || plugin.app.workspace.getLeavesOfType(VIEW_TYPE_HANDWRITING)
 			.some(l => (l.view as DrawingEditorView).getEmbedId() === embedId);
 		const inViewport = rect.width > 0 && rect.top < window.innerHeight && rect.bottom > 0;
 		btn.classList.toggle('hwm_hidden', !(inViewport && !editorOpen));
